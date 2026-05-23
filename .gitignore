@@ -1,6 +1,9 @@
 # PyCharm / IntelliJ
 .idea/
 
+# GloVe embeddings (large files — download with: python download_glove.py)
+glove/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1,23 +1,32 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"    # silence TensorFlow C++ logs
+os.environ["TF_ENABLE_ONEDNN_OPTS"]  = "0"  # silence oneDNN messages
+
 """
 Text Emotion Classifier — Training Script
 ==========================================
 Trains a Bidirectional LSTM model to classify text into one of six emotions:
   joy, sadness, anger, fear, love, surprise
 
-What this script does:
-  1. Loads and explores train.txt / val.txt
-  2. Tokenises text and pads sequences to a fixed length
-  3. Applies RandomOverSampler to balance class counts
-  4. Builds a Bidirectional LSTM model (better than Flatten for NLP)
-  5. Trains with EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-  6. Saves model + tokenizer + label-encoder + config to saved_model/
-  7. Prints a classification report on the validation set
+GloVe Pre-trained Embeddings (optional but recommended)
+--------------------------------------------------------
+GloVe gives every word a rich, pre-trained meaning vector learned from
+billions of words. This means even words the model has never seen in the
+training data (e.g. "trophy", "medal") already have semantic meaning —
+they know they're related to "win", "award", "achievement" — so the model
+can make much better predictions on unseen vocabulary.
+
+To enable GloVe:
+    python download_glove.py      ← downloads glove.6B.100d.txt (~350 MB)
+    python train.py               ← will auto-detect and use GloVe
+
+Without GloVe:
+    python train.py               ← falls back to random embeddings (still works)
 
 Usage:
     python train.py
 """
 
-import os
 import json
 import pickle
 import logging
@@ -52,11 +61,13 @@ CONFIG = {
     "max_words":   20000,   # Vocabulary cap (most-frequent N words kept)
     "max_len":     100,     # Sequences padded/truncated to this many tokens
     # Model
-    "embed_dim":   128,     # Size of each word embedding vector
-    "lstm_units":  128,     # Number of LSTM hidden units per direction
-    "dropout":     0.4,     # Dropout rate after embedding & after LSTM
+    "embed_dim":   100,     # Must match GloVe dimension (50 / 100 / 200 / 300)
+    "lstm_units":  128,     # LSTM hidden units per direction
+    "dropout":     0.4,
+    # GloVe — set to None to skip and use random embeddings instead
+    "glove_path":  "glove/glove.6B.100d.txt",
     # Training
-    "epochs":      20,      # Maximum epochs (EarlyStopping may stop it sooner)
+    "epochs":      20,
     "batch_size":  64,
     "random_seed": 42,
 }
@@ -82,7 +93,6 @@ log = logging.getLogger(__name__)
 def load_data(filepath: str) -> pd.DataFrame:
     """
     Load a semicolon-delimited  text;emotion  file.
-
     Returns a DataFrame with columns ['Text', 'Emotions'].
     Rows that are empty or contain NaN are dropped.
     """
@@ -90,7 +100,7 @@ def load_data(filepath: str) -> pd.DataFrame:
     df = pd.read_csv(filepath, sep=";", header=None, names=["Text", "Emotions"])
     before = len(df)
     df.dropna(inplace=True)
-    df = df[df["Text"].str.strip() != ""]          # drop blank-text rows
+    df = df[df["Text"].str.strip() != ""]
     after = len(df)
     if before != after:
         log.warning(f"  Dropped {before - after} invalid rows from {filepath}.")
@@ -114,31 +124,109 @@ def explore_data(df: pd.DataFrame, label: str = "Dataset") -> None:
 
 
 # ══════════════════════════════════════════════
+# GloVe embeddings
+# ══════════════════════════════════════════════
+
+def load_glove_embeddings(
+    glove_path: str, word_index: dict, embed_dim: int, max_words: int
+) -> np.ndarray:
+    """
+    Load GloVe pre-trained word vectors and build an embedding matrix
+    aligned with our tokenizer's word index.
+
+    Why GloVe?
+    ──────────
+    Without GloVe, the Embedding layer starts with random numbers and only
+    learns from words that appear in the training data. A word like "trophy"
+    that never appeared in train.txt gets a random, meaningless vector.
+
+    With GloVe, "trophy" already starts with a vector that captures its
+    relationship to "win", "award", "achievement", "prize" — learned from
+    billions of words across Wikipedia and news articles. The model can
+    immediately reason about it correctly.
+
+    Words not found in GloVe fall back to small random initialisation so
+    training can still fine-tune them from context.
+    """
+    log.info(f"Loading GloVe embeddings from: {glove_path}")
+    glove_vectors = {}
+    with open(glove_path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            word   = parts[0]
+            vector = np.array(parts[1:], dtype=np.float32)
+            glove_vectors[word] = vector
+
+    log.info(f"  Loaded {len(glove_vectors):,} GloVe vectors (dim={embed_dim})")
+
+    vocab_size = min(len(word_index) + 1, max_words + 1)
+
+    # Random small init for words not in GloVe (better than zeros — they can
+    # still be learned during fine-tuning instead of being invisible)
+    embedding_matrix = np.random.normal(
+        scale=0.1, size=(vocab_size, embed_dim)
+    ).astype(np.float32)
+    embedding_matrix[0] = 0  # index 0 = padding → always zero vector
+
+    found = 0
+    for word, idx in word_index.items():
+        if idx >= max_words:
+            continue
+        if word in glove_vectors:
+            embedding_matrix[idx] = glove_vectors[word]
+            found += 1
+
+    total = min(len(word_index), max_words)
+    pct   = found / total * 100
+    log.info(f"  GloVe coverage : {found:,} / {total:,} vocabulary words ({pct:.1f}%)")
+    if pct < 50:
+        log.warning("  Low GloVe coverage — check that embed_dim matches the GloVe file.")
+    return embedding_matrix
+
+
+# ══════════════════════════════════════════════
 # Model
 # ══════════════════════════════════════════════
 
-def build_model(vocab_size: int, num_classes: int, cfg: dict) -> Sequential:
+def build_model(
+    vocab_size: int,
+    num_classes: int,
+    cfg: dict,
+    embedding_matrix: np.ndarray = None,
+) -> Sequential:
     """
-    Build a Bidirectional LSTM classifier.
+    Build a Bidirectional LSTM emotion classifier.
 
     Architecture rationale
     ─────────────────────
-    • Embedding          – Converts token IDs to dense vectors; trainable from scratch.
+    • Embedding          – Maps token IDs to dense vectors.
+                           If embedding_matrix is provided, initialised from GloVe
+                           (trainable=True so they are fine-tuned during training).
     • SpatialDropout1D   – Drops entire embedding channels; more effective than
-                           regular dropout for sequential data.
+                           regular dropout for sequential / embedding data.
     • Bidirectional LSTM – Reads the sequence left-to-right AND right-to-left,
-                           so each token has context from the full sentence.
-                           Significantly outperforms a simple Flatten approach.
-    • Dropout            – Standard regularisation before the dense head.
-    • Dense(64, relu)    – Intermediate representation.
-    • Dense(softmax)     – One output neuron per emotion class.
+                           giving each token context from the full sentence.
+    • Dropout + Dense    – Standard dense head for classification.
     """
-    model = Sequential([
-        Embedding(
+    if embedding_matrix is not None:
+        embedding_layer = Embedding(
             input_dim=vocab_size,
             output_dim=cfg["embed_dim"],
             input_length=cfg["max_len"],
-        ),
+            weights=[embedding_matrix],
+            trainable=True,   # fine-tune GloVe vectors during training
+        )
+        log.info("  Embedding layer : GloVe pre-trained (fine-tuning enabled)")
+    else:
+        embedding_layer = Embedding(
+            input_dim=vocab_size,
+            output_dim=cfg["embed_dim"],
+            input_length=cfg["max_len"],
+        )
+        log.info("  Embedding layer : randomly initialised")
+
+    model = Sequential([
+        embedding_layer,
         SpatialDropout1D(cfg["dropout"]),
         Bidirectional(LSTM(cfg["lstm_units"], return_sequences=False)),
         Dropout(cfg["dropout"]),
@@ -204,15 +292,12 @@ def main() -> None:
     tokenizer = Tokenizer(num_words=CONFIG["max_words"], oov_token="<OOV>")
     tokenizer.fit_on_texts(train_df["Text"].tolist())   # fit on TRAIN only
     vocab_size = min(len(tokenizer.word_index) + 1, CONFIG["max_words"] + 1)
-    log.info(f"  Vocabulary size: {vocab_size:,}")
+    log.info(f"  Vocabulary size : {vocab_size:,}")
 
     def encode(texts):
         seqs = tokenizer.texts_to_sequences(texts)
         return pad_sequences(
-            seqs,
-            maxlen=CONFIG["max_len"],
-            padding="post",
-            truncating="post",
+            seqs, maxlen=CONFIG["max_len"], padding="post", truncating="post"
         )
 
     X_train = encode(train_df["Text"].tolist())
@@ -235,33 +320,44 @@ def main() -> None:
     y_train = to_categorical(y_train_int, num_classes=num_classes)
     y_val   = to_categorical(y_val_int,   num_classes=num_classes)
 
-    # ── 5. Build model ────────────────────────────────────────────────────
+    # ── 5. Load GloVe (if available) ─────────────────────────────────────
+    embedding_matrix = None
+    glove_path = CONFIG.get("glove_path")
+
+    if glove_path and os.path.isfile(glove_path):
+        embedding_matrix = load_glove_embeddings(
+            glove_path, tokenizer.word_index, CONFIG["embed_dim"], CONFIG["max_words"]
+        )
+    elif glove_path:
+        log.warning(f"\nGloVe file not found at '{glove_path}'.")
+        log.warning("Run  python download_glove.py  to download it (~350 MB).")
+        log.warning("Training will proceed with random embeddings.\n")
+
+    # ── 6. Build model ────────────────────────────────────────────────────
     log.info("\nBuilding model...")
-    model = build_model(vocab_size, num_classes, CONFIG)
+    model = build_model(vocab_size, num_classes, CONFIG, embedding_matrix)
     model.summary(print_fn=log.info)
 
-    # ── 6. Callbacks ──────────────────────────────────────────────────────
+    # ── 7. Callbacks ──────────────────────────────────────────────────────
     ckpt_path = os.path.join(CONFIG["model_dir"], "best_model.keras")
     callbacks = [
-        # Stop early if val_accuracy doesn't improve for 4 epochs
         EarlyStopping(
             monitor="val_accuracy", patience=4,
             restore_best_weights=True, verbose=1,
         ),
-        # Save the best checkpoint
         ModelCheckpoint(
             ckpt_path, monitor="val_accuracy",
             save_best_only=True, verbose=1,
         ),
-        # Halve the learning rate when val_loss plateaus
         ReduceLROnPlateau(
             monitor="val_loss", factor=0.5,
             patience=2, min_lr=1e-5, verbose=1,
         ),
     ]
 
-    # ── 7. Train ──────────────────────────────────────────────────────────
-    log.info(f"\nTraining — up to {CONFIG['epochs']} epochs "
+    # ── 8. Train ──────────────────────────────────────────────────────────
+    using_glove = "with GloVe" if embedding_matrix is not None else "without GloVe (random embeddings)"
+    log.info(f"\nTraining {using_glove} — up to {CONFIG['epochs']} epochs "
              f"(batch_size={CONFIG['batch_size']})...\n")
     history = model.fit(
         X_train, y_train,
@@ -271,8 +367,7 @@ def main() -> None:
         callbacks=callbacks,
     )
 
-    # ── 8. Save artefacts ─────────────────────────────────────────────────
-    # best_model.keras is already saved by ModelCheckpoint; save the rest:
+    # ── 9. Save artefacts ─────────────────────────────────────────────────
     tok_path = os.path.join(CONFIG["model_dir"], "tokenizer.pkl")
     le_path  = os.path.join(CONFIG["model_dir"], "label_encoder.pkl")
     cfg_path = os.path.join(CONFIG["model_dir"], "config.json")
@@ -289,7 +384,7 @@ def main() -> None:
     log.info(f"Saved → {le_path}")
     log.info(f"Saved → {cfg_path}")
 
-    # ── 9. Validation classification report ──────────────────────────────
+    # ── 10. Validation classification report ─────────────────────────────
     log.info("\nValidation set — classification report:")
     y_val_pred = np.argmax(model.predict(X_val, verbose=0), axis=1)
     report = classification_report(
@@ -297,7 +392,7 @@ def main() -> None:
     )
     log.info(f"\n{report}")
 
-    # ── 10. Save plots ────────────────────────────────────────────────────
+    # ── 11. Save plots ────────────────────────────────────────────────────
     plot_history(history, CONFIG["model_dir"])
 
     log.info("\n✅  Training complete!")
